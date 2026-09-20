@@ -664,7 +664,7 @@ impl Font {
         self.shaper.get_or_init(|| Shaper::new(self)).baseline()
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     pub(crate) fn find_fallback_using_system_font_api(
         &self,
         _: &FallbackFontSelectionOptions,
@@ -1112,7 +1112,7 @@ pub struct FontBaseline {
 /// let mapped_weight = apply_font_config_to_style_mapping(&mapping, weight as f64);
 /// ```
 #[cfg(all(
-    any(target_os = "linux", target_os = "macos", target_os = "freebsd"),
+    any(target_os = "linux", target_os = "macos", target_os = "ios", target_os = "freebsd"),
     not(target_env = "ohos")
 ))]
 pub(crate) fn map_platform_values_to_style_values(mapping: &[(f64, f64)], value: f64) -> f64 {

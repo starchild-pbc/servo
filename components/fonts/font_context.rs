@@ -558,10 +558,14 @@ impl FontContext {
         );
 
         let identifier = FontIdentifier::Web(url);
-        let Ok(handle) = PlatformFont::new_from_data(identifier.clone(), &font_data, None, false)
-        else {
-            return false;
-        };
+        let handle =
+            match PlatformFont::new_from_data(identifier.clone(), &font_data, None, false) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    debug!("Web font identifier={identifier:?} was rejected: {error}");
+                    return false;
+                },
+            };
 
         self.font_data.write().insert(identifier.clone(), font_data);
         let descriptor = handle.descriptor();
@@ -1297,13 +1301,20 @@ impl RemoteWebFontDownloader {
             return;
         }
 
+        let request_mode = if url.scheme() == "file" &&
+            document_context.document_url.scheme() == "file"
+        {
+            RequestMode::NoCors
+        } else {
+            RequestMode::CorsMode
+        };
         let request = RequestBuilder::new(
             webview_id,
             UrlWithBlobClaim::from_url_without_having_claimed_blob(url.clone().into()),
             Referrer::ReferrerUrl(document_context.document_url.clone()),
         )
         .destination(Destination::Font)
-        .mode(RequestMode::CorsMode)
+        .mode(request_mode)
         .credentials_mode(CredentialsMode::CredentialsSameOrigin)
         .service_workers_mode(ServiceWorkersMode::All)
         .policy_container(document_context.policy_container.clone())
