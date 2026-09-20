@@ -315,6 +315,20 @@ impl Painter {
 
         self.send_zoom_and_scroll_offset_updates(need_zoom, scroll_offset_updates);
 
+        // A live native scroll animation only advances at frame starts, and
+        // frame starts only happen while repaints are scheduled. A sub-pixel
+        // animation step leaves the WebRender frame unchanged (sampled scroll
+        // offsets are snapped to whole pixels), so WebRender reports it as not
+        // needing a render, no repaint reason is recorded, and the animation
+        // would park mid-flight. Keep requesting repaints until it finishes.
+        if self
+            .webview_renderers
+            .values()
+            .any(WebViewRenderer::has_ongoing_native_scroll_animation)
+        {
+            self.set_needs_repaint(RepaintReason::StartedFlinging);
+        }
+
         if let Some(colors) = self.web_content_animator.update(&self.webview_renderers) {
             let mut transaction = Transaction::new();
             transaction.reset_dynamic_properties();
@@ -671,8 +685,8 @@ impl Painter {
                 },
             );
 
-            let scaled_webview_rect = webview_renderer.rect /
-                webview_renderer.device_pixels_per_page_pixel_not_including_pinch_zoom();
+            let scaled_webview_rect = webview_renderer.rect
+                / webview_renderer.device_pixels_per_page_pixel_not_including_pinch_zoom();
             builder.push_iframe(
                 LayoutRect::from_untyped(&scaled_webview_rect.to_untyped()),
                 LayoutRect::from_untyped(&scaled_webview_rect.to_untyped()),
@@ -716,10 +730,12 @@ impl Painter {
         for webview_renderer in self.webview_renderers.values() {
             for details in webview_renderer.pipelines.values() {
                 for node in details.scroll_tree.nodes.iter() {
-                    let (Some(offset), Some(external_id)) = (node.offset(), node.external_id())
+                    let (Some(logical_offset), Some(external_id)) =
+                        (node.offset(), node.external_id())
                     else {
                         continue;
                     };
+                    let offset = webview_renderer.visual_scroll_offset(external_id, logical_offset);
                     // Skip scroll offsets that are zero, as they are the default.
                     if offset == LayoutVector2D::zero() {
                         continue;
@@ -770,10 +786,10 @@ impl Painter {
         let mut flags = renderer.get_debug_flags();
         let flag = match option {
             WebRenderDebugOption::Profiler => {
-                webrender::DebugFlags::PROFILER_DBG |
-                    webrender::DebugFlags::GPU_TIME_QUERIES |
-                    webrender::DebugFlags::GPU_SAMPLE_QUERIES
-            },
+                webrender::DebugFlags::PROFILER_DBG
+                    | webrender::DebugFlags::GPU_TIME_QUERIES
+                    | webrender::DebugFlags::GPU_SAMPLE_QUERIES
+            }
             WebRenderDebugOption::TextureCacheDebug => webrender::DebugFlags::TEXTURE_CACHE_DBG,
             WebRenderDebugOption::RenderTargetDebug => webrender::DebugFlags::RENDER_TARGET_DBG,
         };
@@ -1091,7 +1107,7 @@ impl Painter {
                     self.animation_image_cache.insert(key, Arc::clone(&data));
                 }
                 ImageData::Raw(data)
-            },
+            }
             SerializableImageData::External(image) => ImageData::External(image),
         }
     }
@@ -1111,18 +1127,18 @@ impl Painter {
                         ),
                         None,
                     );
-                },
+                }
                 ImageUpdate::DeleteImage(key) => {
                     txn.delete_image(key);
                     self.frame_delayer.delete_image(key);
                     self.animation_image_cache.remove(&key);
-                },
+                }
                 ImageUpdate::UpdateImage(key, desc, data, epoch) => {
                     if let Some(epoch) = epoch {
                         self.frame_delayer.update_image(key, epoch);
                     }
                     txn.update_image(key, desc, data.into(), &DirtyRect::All)
-                },
+                }
                 ImageUpdate::UpdateImageForAnimation(image_key, desc) => {
                     let Some(image) = self.animation_image_cache.get(&image_key) else {
                         error!("Could not find image key in image cache.");
@@ -1134,7 +1150,7 @@ impl Painter {
                         ImageData::new_shared(image.clone()),
                         &DirtyRect::All,
                     );
-                },
+                }
             }
         }
 
@@ -1377,7 +1393,7 @@ impl Painter {
                                 .as_device_point(webview_renderer.device_pixels_per_page_pixel());
                             self.last_mouse_move_position = Some(event_point);
                         }
-                    },
+                    }
                     InputEvent::MouseLeftViewport(_) => {
                         self.last_mouse_move_position = None;
                     },
