@@ -82,6 +82,7 @@ webxr = ["webgl", "gamepad", "webxr-api", "script_bindings/webxr"]
 workspace = true
 
 [dependencies]
+mozangle = { workspace = true, optional = true }
 aes = { workspace = true, optional = true }
 aes-gcm = { workspace = true, optional = true }
 aes-kw = { workspace = true, optional = true }
@@ -225,4 +226,3 @@ xpath = { workspace = true }
 zeroize = { workspace = true, optional = true }
 
 [target.'cfg(not(target_os = "ios"))'.dependencies]
-mozangle = { workspace = true, optional = true }

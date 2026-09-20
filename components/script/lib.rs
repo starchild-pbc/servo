@@ -3,6 +3,12 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 #![cfg_attr(crown, feature(register_tool))]
+// The iOS build disables the webgpu, gamepad, bluetooth, and webxr features.
+// Their backing items stay in the tree and read as dead code or unused.
+#![cfg_attr(
+    target_os = "ios",
+    allow(dead_code, unused_imports, unused_variables)
+)]
 #![deny(unsafe_code)]
 #![doc = "The script crate contains all matters DOM."]
 // Register the linter `crown`, which is the Servo-specific linter for the script crate.
