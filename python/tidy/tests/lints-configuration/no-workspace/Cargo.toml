@@ -5,4 +5,4 @@ license = "MPL-2.0"
 publish = false
 
 [lints]
-foo = true
+rust = { unsafe_code = "warn" }
