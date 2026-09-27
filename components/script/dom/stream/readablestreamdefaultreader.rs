@@ -13,6 +13,7 @@ use js::jsapi::Heap;
 use js::jsval::{JSVal, UndefinedValue};
 use js::realm::CurrentRealm;
 use js::rust::{HandleObject as SafeHandleObject, HandleValue as SafeHandleValue};
+use js::typedarray::Uint8Array;
 use script_bindings::cell::DomRefCell;
 use script_bindings::reflector::{
     Reflector, reflect_dom_object_with_cx, reflect_dom_object_with_proto,
@@ -30,7 +31,7 @@ use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::{Promise, RootedPromise, TracedPromise};
 use crate::dom::promisenativehandler::{Callback, PromiseNativeHandler};
-use crate::dom::readablestream::{ReadableStream, bytes_from_chunk_jsval};
+use crate::dom::readablestream::ReadableStream;
 use crate::dom::stream::defaultteereadrequest::DefaultTeeReadRequest;
 use crate::dom::stream::readablestreamgenericreader::ReadableStreamGenericReader;
 use crate::dom::types::ReadableStreamDefaultController;
@@ -149,38 +150,49 @@ impl ReadRequest {
                 // Spec: chunk steps, given chunk
                 let global = reader.global();
 
-                match bytes_from_chunk_jsval(cx, &chunk) {
-                    Ok(vec) => {
-                        // Step 2. Append the bytes represented by chunk to bytes.
-                        bytes.borrow_mut().extend_from_slice(&vec);
+                // Step 1. If chunk is not a Uint8Array object, call failureSteps with a TypeError and abort.
+                let chunk_array = if chunk.get().is_object() {
+                    Uint8Array::from(chunk.get().to_object()).ok()
+                } else {
+                    None
+                };
+                let Some(chunk_array) = chunk_array else {
+                    rooted!(&in(cx) let mut v = UndefinedValue());
+                    Error::Type(c"The chunk is not a Uint8Array.".to_owned()).to_jsval(
+                        cx,
+                        &global,
+                        v.handle_mut(),
+                    );
+                    (failure_steps)(cx, v.handle());
+                    return;
+                };
 
-                        // Step 3. Read-loop given reader, bytes, successSteps, and failureSteps.
-                        // Spec note: Avoid direct recursion; queue into a microtask.
-                        // Resolving the promise will queue a microtask to call into the native handler.
-                        let tick = Promise::new(cx, &global);
-                        tick.resolve_native(cx, &());
-
-                        let handler = PromiseNativeHandler::new(
-                            cx,
-                            &global,
-                            Some(Box::new(ContinueReadMicrotask {
-                                reader: Dom::from_ref(reader),
-                                request: self.clone(),
-                            })),
-                            None,
-                        );
-
-                        let mut realm = enter_auto_realm(cx, &*global);
-                        let cx = &mut realm.current_realm();
-                        tick.append_native_handler(cx, &handler);
-                    },
-                    Err(err) => {
-                        // Step 1. If chunk is not a Uint8Array object, call failureSteps with a TypeError and abort.
-                        rooted!(&in(cx) let mut v = UndefinedValue());
-                        err.to_jsval(cx, &global, v.handle_mut());
-                        (failure_steps)(cx, v.handle());
-                    },
+                // Step 2. Append the bytes represented by chunk to bytes.
+                // Copy them from the typed array's buffer in one step. A detached
+                // buffer represents no bytes.
+                if let Some(chunk_bytes) = chunk_array.as_slice_safe(cx.no_gc()) {
+                    bytes.borrow_mut().extend_from_slice(chunk_bytes);
                 }
+
+                // Step 3. Read-loop given reader, bytes, successSteps, and failureSteps.
+                // Spec note: Avoid direct recursion; queue into a microtask.
+                // Resolving the promise will queue a microtask to call into the native handler.
+                let tick = Promise::new(cx, &global);
+                tick.resolve_native(cx, &());
+
+                let handler = PromiseNativeHandler::new(
+                    cx,
+                    &global,
+                    Some(Box::new(ContinueReadMicrotask {
+                        reader: Dom::from_ref(reader),
+                        request: self.clone(),
+                    })),
+                    None,
+                );
+
+                let mut realm = enter_auto_realm(cx, &*global);
+                let cx = &mut realm.current_realm();
+                tick.append_native_handler(cx, &handler);
             },
         }
     }

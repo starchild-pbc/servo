@@ -11,7 +11,7 @@ use std::rc::Rc;
 
 use dom_struct::dom_struct;
 use js::context::JSContext;
-use js::conversions::{FromJSValConvertible, ToJSValConvertible};
+use js::conversions::ToJSValConvertible;
 use js::jsapi::{Heap, JSObject};
 use js::jsval::{JSVal, ObjectValue, UndefinedValue};
 use js::realm::CurrentRealm;
@@ -19,7 +19,7 @@ use js::rust::{
     HandleObject as SafeHandleObject, HandleValue as SafeHandleValue,
     MutableHandleValue as SafeMutableHandleValue,
 };
-use js::typedarray::{ArrayBufferViewU8, Uint8};
+use js::typedarray::{ArrayBufferViewU8, Uint8, Uint8Array};
 use rustc_hash::FxHashMap;
 use servo_base::generic_channel::GenericSharedMemory;
 use servo_base::id::{MessagePortId, MessagePortIndex};
@@ -40,7 +40,7 @@ use crate::dom::abortsignal::{AbortAlgorithm, AbortSignal};
 use crate::dom::bindings::codegen::Bindings::ReadableStreamDefaultReaderBinding::ReadableStreamDefaultReaderMethods;
 use crate::dom::bindings::codegen::Bindings::ReadableStreamDefaultControllerBinding::ReadableStreamDefaultController_Binding::ReadableStreamDefaultControllerMethods;
 use crate::dom::bindings::codegen::Bindings::UnderlyingSourceBinding::UnderlyingSource as JsUnderlyingSource;
-use crate::dom::bindings::conversions::{ConversionBehavior, ConversionResult, get_property, get_property_jsval};
+use crate::dom::bindings::conversions::{ConversionResult, get_property, get_property_jsval};
 use crate::dom::bindings::error::{Error, ErrorToJsval, Fallible};
 use crate::dom::bindings::codegen::GenericBindings::WritableStreamDefaultWriterBinding::WritableStreamDefaultWriter_Binding::WritableStreamDefaultWriterMethods;
 use crate::dom::stream::writablestream::WritableStream;
@@ -2445,7 +2445,8 @@ pub(crate) fn get_read_promise_done(
         .ok_or(Error::Type(c"Promise has no done property.".to_owned()))
 }
 
-/// Get the `value` property of an object that a read promise resolved to.
+/// Get the bytes of the `value` property of an object that a read promise
+/// resolved to. The value must be a `Uint8Array`.
 pub(crate) fn get_read_promise_bytes(
     cx: &mut JSContext,
     v: &SafeHandleValue,
@@ -2457,27 +2458,15 @@ pub(crate) fn get_read_promise_bytes(
     }
 
     rooted!(&in(cx) let object = v.to_object());
-    get_property::<Vec<u8>>(
-        cx,
-        object.handle(),
-        c"value",
-        ConversionBehavior::EnforceRange,
-    )?
-    .ok_or(Error::Type(c"Promise has no value property.".to_owned()))
-}
-
-/// Convert a raw stream `chunk` JS value to `Vec<u8>`.
-/// This mirrors the conversion used inside `get_read_promise_bytes`,
-/// but operates on the raw chunk (no `{ value, done }` wrapper).
-pub(crate) fn bytes_from_chunk_jsval(
-    cx: &mut JSContext,
-    chunk: &RootedTraceableBox<Heap<JSVal>>,
-) -> Result<Vec<u8>, Error> {
-    match Vec::<u8>::from_jsval(cx, chunk.handle(), ConversionBehavior::EnforceRange) {
-        Ok(ConversionResult::Success(vec)) => Ok(vec),
-        Ok(ConversionResult::Failure(error)) => Err(Error::Type(error.into_owned())),
-        _ => Err(Error::Type(c"Unknown format for bytes read.".to_owned())),
+    rooted!(&in(cx) let mut value = UndefinedValue());
+    get_property_jsval(cx, object.handle(), c"value", value.handle_mut())?;
+    let not_uint8_array = || Error::Type(c"The read value is not a Uint8Array.".to_owned());
+    if !value.is_object() {
+        return Err(not_uint8_array());
     }
+    // Copy the bytes out of the typed array's buffer. A detached buffer has no bytes.
+    let array = Uint8Array::from(value.to_object()).map_err(|()| not_uint8_array())?;
+    Ok(array.to_vec().unwrap_or_default())
 }
 
 /// <https://streams.spec.whatwg.org/#rs-transfer>
