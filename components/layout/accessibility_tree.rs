@@ -145,6 +145,10 @@ struct AccessibilityNode {
     scroll_offset: Option<LayoutVector2D>,
     /// Any dirty state for the current update.
     dirty_state: DirtyState,
+    explicit_label: Option<String>,
+    labelled_by: Vec<String>,
+    dom_id: Option<String>,
+    viewport_bounds: Option<accesskit::Rect>,
 }
 
 /// A retained, internal representation of the accessibility tree for a document.
@@ -249,8 +253,91 @@ impl AccessibilityTree {
         self.apply_changes_from_dom_tree(&context, &mut update);
 
         self.handle_pending_scroll_updates(&mut update);
+        self.update_relations_and_bounds(&mut update);
 
         update.finalize(self)
+    }
+
+    fn update_relations_and_bounds(&self, update: &mut AccessibilityUpdate) {
+        let Some(root) = self.root_node.clone() else {
+            return;
+        };
+        let mut nodes = vec![root];
+        let mut index = 0;
+        while index < nodes.len() {
+            let children = nodes[index].borrow().child_nodes.clone();
+            nodes.extend(children);
+            index += 1;
+        }
+        let mut ids = FxHashMap::default();
+        for node in &nodes {
+            let node = node.borrow();
+            if let Some(id) = &node.dom_id {
+                ids.entry(id.clone()).or_insert(node.id);
+            }
+        }
+        let referenced: FxHashSet<_> = nodes
+            .iter()
+            .flat_map(|node| {
+                node.borrow()
+                    .labelled_by
+                    .iter()
+                    .filter_map(|id| ids.get(id).copied())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for node in nodes {
+            let mut node = node.borrow_mut();
+            update.counters.nodes_updated_from_tree += 1;
+            let labelled_by: Vec<_> = node
+                .labelled_by
+                .iter()
+                .filter_map(|id| ids.get(id).copied())
+                .filter(|id| *id != node.id)
+                .collect();
+            if node.accesskit_node.labelled_by() != labelled_by {
+                node.accesskit_node.set_labelled_by(labelled_by.clone());
+                node.dirty_state |= DirtyState::Updated;
+            }
+            let label = if labelled_by.is_empty() {
+                node.explicit_label.clone().or_else(|| {
+                    (NAME_FROM_CONTENTS_ROLES.contains(&node.role())
+                        || referenced.contains(&node.id))
+                    .then(|| node.text_from_descendants())
+                })
+            } else {
+                None
+            };
+            match label {
+                Some(label) => {
+                    node.set_label(&label);
+                },
+                None => {
+                    node.clear_label();
+                },
+            }
+            let mut transform = node
+                .accesskit_node
+                .transform()
+                .copied()
+                .unwrap_or(Affine::IDENTITY);
+            for ancestor in node.ancestors() {
+                transform = ancestor
+                    .borrow()
+                    .accesskit_node
+                    .transform()
+                    .copied()
+                    .unwrap_or(Affine::IDENTITY)
+                    * transform;
+            }
+            match node.viewport_bounds {
+                Some(bounds) => node.set_bounds(transform.inverse().transform_rect_bbox(bounds)),
+                None => node.clear_bounds(),
+            }
+            if node.dirty_state.updated() {
+                update.add(&mut node);
+            }
+        }
     }
 
     /// Add all given scroll updates to [`Self::pending_scroll_updates`].
@@ -672,6 +759,13 @@ fn role_from_dom_node(dom_node: &ServoLayoutNode<'_>) -> Role {
     if let Some(dom_element) = dom_node.as_element() {
         role_from_role_attribute(&dom_element).unwrap_or_else(|| {
             let local_name = dom_element.local_name().to_ascii_lowercase();
+            if local_name == local_name!("a")
+                && dom_element
+                    .attribute(&ns!(), &local_name!("href"))
+                    .is_some()
+            {
+                return Role::Link;
+            }
             *HTML_ELEMENT_ROLE_MAPPINGS
                 .get(&local_name)
                 .unwrap_or(&Role::GenericContainer)
@@ -732,6 +826,10 @@ impl AccessibilityNode {
             opaque_node: None,
             scroll_offset: None,
             dirty_state: DirtyState::empty(),
+            explicit_label: None,
+            labelled_by: Vec::new(),
+            dom_id: None,
+            viewport_bounds: None,
         }
     }
 
@@ -765,8 +863,8 @@ impl AccessibilityNode {
             ));
             self.update_bounds_from_dom_node(&dom_node, context, update);
 
-            if local_damage.contains(LocalAccessibilityDamage::SubtreeChanged) &&
-                let Some(scroll_offset) = self.scroll_offset
+            if local_damage.contains(LocalAccessibilityDamage::SubtreeChanged)
+                && let Some(scroll_offset) = self.scroll_offset
             {
                 // If children have changed, re-set the scroll transforms on all children.
                 self.set_scroll_offset(scroll_offset, update);
@@ -785,8 +883,6 @@ impl AccessibilityNode {
             }
         }
         self.dirty_state -= DirtyState::DescendantHasDamage;
-
-        local_damage.insert(self.update_node_local(local_damage, update));
 
         if self.dirty_state.updated() {
             update.add(self);
@@ -807,7 +903,6 @@ impl AccessibilityNode {
         }
         for node in self.ancestors() {
             let mut node = node.borrow_mut();
-            node.update_node_local(LocalAccessibilityDamage::SubtreeChanged, update);
             node.dirty_state -= DirtyState::DescendantHasDamage;
             if node.dirty_state.updated() {
                 update.add(&mut node);
@@ -863,8 +958,8 @@ impl AccessibilityNode {
 
         // Iterate over existing children and DOM children while they match. No action is necessary
         // for these nodes.
-        while let Some(&old_id) = old_child_ids.peek() &&
-            let Some(dom_child) = remaining_dom_children.peek()
+        while let Some(&old_id) = old_child_ids.peek()
+            && let Some(dom_child) = remaining_dom_children.peek()
         {
             if tree.existing_id_for_opaque(dom_child.opaque()) == Some(*old_id) {
                 update.insert_dom_node(*old_id, *dom_child);
@@ -929,13 +1024,74 @@ impl AccessibilityNode {
     fn update_properties_from_dom_node(
         &mut self,
         dom_node: &ServoLayoutNode,
-        dom_damage: AccessibilityDamage,
+        _dom_damage: AccessibilityDamage,
     ) -> LocalAccessibilityDamage {
         let mut local_damage = LocalAccessibilityDamage::empty();
-        if !dom_damage.contains(AccessibilityDamage::Node) {
-            return local_damage;
-        }
         local_damage.insert(self.set_role(role_from_dom_node(dom_node)));
+        if let Some(element) = dom_node.as_element() {
+            self.dom_id = element
+                .attribute_as_str(&ns!(), &local_name!("id"))
+                .map(str::to_owned);
+            self.explicit_label = element
+                .attribute_as_str(&ns!(), &local_name!("aria-label"))
+                .filter(|label| !label.trim().is_empty())
+                .map(str::to_owned);
+            self.labelled_by = element
+                .attribute_as_str(&ns!(), &local_name!("aria-labelledby"))
+                .unwrap_or("")
+                .split_ascii_whitespace()
+                .map(str::to_owned)
+                .collect();
+            let mut native = self.accesskit_node.clone();
+            if let Some(data) = element.style_data() {
+                if let Some(style) = data.element_data.borrow().styles.get_primary() {
+                    if style.get_effects().opacity == 0.0 {
+                        native.set_hidden();
+                    } else {
+                        native.clear_hidden();
+                    }
+                    if style.get_box().overflow_x != style::values::computed::Overflow::Visible
+                        || style.get_box().overflow_y != style::values::computed::Overflow::Visible
+                    {
+                        native.set_clips_children();
+                    } else {
+                        native.clear_clips_children();
+                    }
+                }
+            }
+            if element.attribute_as_str(&ns!(), &local_name!("aria-hidden")) == Some("true")
+                || element.attribute(&ns!(), &local_name!("inert")).is_some()
+                || element.attribute(&ns!(), &local_name!("hidden")).is_some()
+            {
+                native.set_hidden();
+            }
+            if element.attribute_as_str(&ns!(), &local_name!("aria-disabled")) == Some("true")
+                || element
+                    .attribute(&ns!(), &local_name!("disabled"))
+                    .is_some()
+            {
+                native.set_disabled();
+            } else {
+                native.clear_disabled();
+            }
+            match element.attribute_as_str(&ns!(), &local_name!("aria-selected")) {
+                Some("true") => native.set_selected(true),
+                Some("false") => native.set_selected(false),
+                _ => native.clear_selected(),
+            }
+            match element
+                .attribute_as_str(&ns!(), &local_name!("aria-valuetext"))
+                .or_else(|| element.attribute_as_str(&ns!(), &local_name!("aria-valuenow")))
+            {
+                Some(value) => native.set_value(value),
+                None => native.clear_value(),
+            }
+            if self.accesskit_node != native {
+                self.accesskit_node = native;
+                self.dirty_state |= DirtyState::Updated;
+            }
+        }
+
         if dom_node.type_id() == Some(LayoutNodeType::Text) {
             let text_content = dom_node.text_content();
             trace!("node text content = {text_content:?}");
@@ -955,18 +1111,13 @@ impl AccessibilityNode {
     ) {
         update.counters.nodes_updated_bounds += 1;
 
-        // Border box without transforms. Bounds are in CSS pixels, relative to the document origin;
-        // scroll containers set translations on their child nodes, and the embedder's graft node
-        // carries the transform that composes them into AccessKit's coordinate space (see the
-        // "Coordinates" section of
-        // <https://docs.rs/accesskit/latest/accesskit/struct.Node.html>).
-        // TODO(#47166): This doesn't take any CSS transforms into account.
+        // Layout supplies viewport bounds with CSS transforms and scrolling applied.
         let bounds = process_box_area_request(
             context.layout_thread,
             context.stacking_context_tree,
             *dom_node,
             BoxAreaType::Border,
-            BoxAreaInclusion::Inlines,
+            BoxAreaInclusion::Inlines | BoxAreaInclusion::Transforms,
         )
         .map(au_rect_to_accesskit_rect);
 
@@ -982,44 +1133,25 @@ impl AccessibilityNode {
         // TODO(#47163): A `display: contents` element generates no box either. Other
         // engines (Blink, WebKit, Gecko) compute its bounds as the union of the bounding boxes of
         // its rendered descendants.
-        match bounds {
-            Some(bounds) => self.set_bounds(bounds),
-            None => self.clear_bounds(),
-        }
+        let visible = dom_node
+            .as_element()
+            .and_then(|element| {
+                element.style_data().map(|data| {
+                    data.element_data
+                        .borrow()
+                        .styles
+                        .get_primary()
+                        .is_none_or(|style| {
+                            style.get_inherited_box().visibility
+                                == style::computed_values::visibility::T::Visible
+                        })
+                })
+            })
+            .unwrap_or(true);
+        self.viewport_bounds = if visible { bounds } else { None };
     }
 
-    /// Update this node's properties based on changes already made to the accessibility tree.
-    /// For example, if there were nodes added or removed in its subtree, its computed text may have
-    /// changed, so that will be recomputed here.
-    /// If any changes are made, add this node to the given [`AccessibilityUpdate`].
-    fn update_node_local(
-        &mut self,
-        local_damage: LocalAccessibilityDamage,
-        update: &mut AccessibilityUpdate,
-    ) -> LocalAccessibilityDamage {
-        let mut new_damage = LocalAccessibilityDamage::empty();
-        if local_damage.is_empty() {
-            return new_damage;
-        }
-        update.counters.nodes_updated_from_tree += 1;
-
-        if local_damage.contains(LocalAccessibilityDamage::SubtreeChanged) ||
-            local_damage.contains(LocalAccessibilityDamage::RoleChanged)
-        {
-            if let Some(text) = self.label_from_descendants() {
-                new_damage.insert(self.set_label(text.as_str()));
-            } else {
-                new_damage.insert(self.clear_label());
-            }
-        }
-
-        new_damage
-    }
-
-    fn label_from_descendants(&self) -> Option<String> {
-        if !NAME_FROM_CONTENTS_ROLES.contains(&self.role()) {
-            return None;
-        }
+    fn text_from_descendants(&self) -> String {
         let mut children = VecDeque::from_iter(self.children().cloned());
         let mut text = String::new();
         while let Some(child) = children.pop_front() {
@@ -1037,7 +1169,7 @@ impl AccessibilityNode {
                 },
             }
         }
-        Some(text.trim().to_owned())
+        text.trim().to_owned()
     }
 
     fn print(&self, print_tree: &mut PrintTree) {
@@ -1488,6 +1620,7 @@ static HTML_ELEMENT_ROLE_MAPPINGS: LazyLock<FxHashMap<LocalName, Role>> = LazyLo
         (local_name!("article"), Role::Article),
         (local_name!("aside"), Role::Complementary),
         (local_name!("body"), Role::RootWebArea),
+        (local_name!("button"), Role::Button),
         (local_name!("footer"), Role::ContentInfo),
         (local_name!("h1"), Role::Heading),
         (local_name!("h2"), Role::Heading),
@@ -1508,16 +1641,13 @@ static HTML_ELEMENT_ROLE_MAPPINGS: LazyLock<FxHashMap<LocalName, Role>> = LazyLo
 /// A map from role names allowed in the 'role' attribute of an HTML element to the corresponding
 /// [`Role`] in AccessKit.
 ///
-/// This is currently just the roles that don't have any [supported][1] or [required][2] properties
-/// and also don't require an [accessible name][3].
-/// [1]: https://w3c.github.io/aria/#supportedState
-/// [2]: https://w3c.github.io/aria/#requiredState
-/// [3]: https://w3c.github.io/aria/#namefromauthor
+/// This map contains the roles that this tree supports.
 static SUPPORTED_ARIA_ROLES: LazyLock<FxHashMap<Atom, Role>> = LazyLock::new(|| {
     [
         (Atom::from("alert"), Role::Alert),
         (Atom::from("banner"), Role::Banner),
         (Atom::from("blockquote"), Role::Blockquote),
+        (Atom::from("button"), Role::Button),
         (Atom::from("caption"), Role::Caption),
         (Atom::from("code"), Role::Code),
         (Atom::from("complementary"), Role::Complementary),
@@ -1531,6 +1661,7 @@ static SUPPORTED_ARIA_ROLES: LazyLock<FxHashMap<Atom, Role>> = LazyLock::new(|| 
         (Atom::from("figure"), Role::Figure),
         (Atom::from("generic"), Role::GenericContainer),
         (Atom::from("insertion"), Role::ContentInsertion),
+        (Atom::from("link"), Role::Link),
         (Atom::from("list"), Role::List),
         (Atom::from("log"), Role::Log),
         (Atom::from("main"), Role::Main),
@@ -1555,5 +1686,8 @@ static SUPPORTED_ARIA_ROLES: LazyLock<FxHashMap<Atom, Role>> = LazyLock::new(|| 
 });
 
 /// <https://w3c.github.io/aria/#namefromcontent>
-static NAME_FROM_CONTENTS_ROLES: LazyLock<FxHashSet<Role>> =
-    LazyLock::new(|| [(Role::Heading)].into_iter().collect());
+static NAME_FROM_CONTENTS_ROLES: LazyLock<FxHashSet<Role>> = LazyLock::new(|| {
+    [Role::Heading, Role::Button, Role::Link]
+        .into_iter()
+        .collect()
+});

@@ -4833,7 +4833,16 @@ impl VirtualMethods for Element {
                 }
                 slottable.assign_a_slot(cx);
             },
-            local_name!("role") => {
+            local_name!("role") |
+            local_name!("aria-label") |
+            local_name!("aria-labelledby") |
+            local_name!("aria-hidden") |
+            local_name!("aria-disabled") |
+            local_name!("aria-selected") |
+            local_name!("aria-valuetext") |
+            local_name!("aria-valuenow") |
+            local_name!("hidden") |
+            local_name!("inert") => {
                 self.upcast::<Node>()
                     .add_pending_accessibility_damage(AccessibilityDamage::Node);
             },
