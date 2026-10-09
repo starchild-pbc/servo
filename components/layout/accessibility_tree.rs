@@ -1111,7 +1111,6 @@ impl AccessibilityNode {
     ) {
         update.counters.nodes_updated_bounds += 1;
 
-        // Layout supplies viewport bounds with CSS transforms and scrolling applied.
         let bounds = process_box_area_request(
             context.layout_thread,
             context.stacking_context_tree,
@@ -1640,8 +1639,6 @@ static HTML_ELEMENT_ROLE_MAPPINGS: LazyLock<FxHashMap<LocalName, Role>> = LazyLo
 
 /// A map from role names allowed in the 'role' attribute of an HTML element to the corresponding
 /// [`Role`] in AccessKit.
-///
-/// This map contains the roles that this tree supports.
 static SUPPORTED_ARIA_ROLES: LazyLock<FxHashMap<Atom, Role>> = LazyLock::new(|| {
     [
         (Atom::from("alert"), Role::Alert),
